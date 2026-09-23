@@ -3,6 +3,11 @@
 
 Also syncs the ``model_provider`` label of local conversation history so that
 every task stays visible in the desktop sidebar after a provider switch.
+
+Rollout files are the source of truth for Codex's paginated history, which is
+tracked with **byte offsets** (``thread_history_*.sqlite``). Any rewrite here
+therefore keeps every line at its original byte length (padding with spaces)
+and refreshes the cached projection so Codex re-reads the rewritten file.
 """
 
 from __future__ import annotations
@@ -486,41 +491,51 @@ def rewrite_session_model_fields(obj: dict, new_model: str, new_provider: str) -
     return changed
 
 
-def rewrite_session_model_file(path: Path, new_model: str, new_provider: str) -> int:
+def rewrite_session_model_file(
+    path: Path, new_model: str, new_provider: str
+) -> tuple[int, int]:
     """Rewrite model-related fields in every JSON line of a rollout file.
 
-    Returns the total number of field changes across the file. Lines that do
-    not parse or contain no model fields are kept byte-for-byte.
+    Returns ``(field changes, byte delta)``. Lines are padded back to their
+    original byte length whenever the rewrite shrinks them, so Codex's
+    byte-offset based history projection stays valid. A longer replacement
+    (a longer model name) is surfaced through the byte delta instead of being
+    hidden, and the caller refreshes the cached projection for that thread.
     """
     raw = path.read_bytes()
-    trailing_newline = raw.endswith(b"\n")
-    lines = raw.splitlines()
+    parts = raw.split(b"\n")
     out: list[bytes] = []
     total_changed = 0
-    for line in lines:
-        stripped = line.strip()
+    delta = 0
+    for part in parts:
+        stripped = part.strip()
         if not stripped:
-            out.append(line)
+            out.append(part)
             continue
         try:
             obj = json.loads(stripped)
         except json.JSONDecodeError:
-            out.append(line)
+            out.append(part)
             continue
         if not isinstance(obj, dict):
-            out.append(line)
+            out.append(part)
             continue
         changed = rewrite_session_model_fields(obj, new_model, new_provider)
-        if changed:
-            out.append(
-                json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            )
-            total_changed += changed
-        else:
-            out.append(line)
-    new_raw = b"\n".join(out) + (b"\n" if trailing_newline else b"")
-    path.write_bytes(new_raw)
-    return total_changed
+        if not changed:
+            out.append(part)
+            continue
+        carriage_return = b"\r" if part.endswith(b"\r") else b""
+        body_limit = len(part) - len(carriage_return)
+        line = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(line) < body_limit:
+            line = pad_line(line, body_limit)
+        delta += len(line) + len(carriage_return) - len(part)
+        out.append(line + carriage_return)
+        total_changed += changed
+    new_raw = b"\n".join(out)
+    if new_raw != raw:
+        path.write_bytes(new_raw)
+    return total_changed, delta
 
 
 def plan_sync(target: str) -> dict:
@@ -632,6 +647,12 @@ def new_first_line(path: Path, new_provider: str) -> str:
     parsed = json.loads(updated)
     if parsed["payload"]["model_provider"] != new_provider:
         raise ValueError("first-line rewrite did not change provider")
+    # session_meta is line 1, so growing it shifts every later byte offset.
+    # Pad when the new provider name is shorter so the line keeps its exact
+    # length; a longer name is surfaced by the caller, which refreshes the
+    # cached history projection afterwards.
+    if len(updated) < len(first):
+        updated += " " * (len(first) - len(updated))
     return updated
 
 
@@ -656,6 +677,7 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
         "errors": [],
         "index_merged": 0,
         "backup_dir": None,
+        "history_rows_dropped": 0,
     }
     db = state_db_path()
     if not db.exists():
@@ -739,13 +761,16 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
 
     # ── rewrite rollout first lines ────────────────────────────────────────
     rewritten: list[str] = []
+    size_deltas: dict[str, int] = {}
     for entry in to_update:
         path = Path(entry["rollout_path"])
         try:
+            size_before = path.stat().st_size
             updated = new_first_line(path, target)
             replace_first_line_bytes(path, updated)
             if new_model:
                 rewrite_session_model_file(path, new_model, target)
+            size_deltas[entry["id"]] = path.stat().st_size - size_before
             rewritten.append(entry["id"])
         except Exception as exc:  # noqa: BLE001
             result["errors"].append(f"rollout rewrite failed for {entry['id']}: {exc}")
@@ -792,6 +817,19 @@ def sync_history(target: str, dry_run: bool = False) -> dict:
         finally:
             if conn is not None:
                 conn.close()
+
+    # ── refresh the cached history projection for rewritten rollouts ───────
+    if rewritten:
+        dropped, refresh_errors = refresh_history_projection(set(rewritten), snap)
+        result["history_rows_dropped"] = dropped
+        result["errors"].extend(refresh_errors)
+        changed_sizes = {tid: delta for tid, delta in size_deltas.items() if delta}
+        if changed_sizes:
+            print(
+                f"WARNING: {len(changed_sizes)} rollout(s) changed byte length "
+                "(longer model or provider name); their cached history was "
+                "refreshed so Codex re-reads them."
+            )
 
     # ── merge missing ids into session_index.jsonl ─────────────────────────
     missing = [tid for tid in plan["session_index_missing_ids"] if tid in rewritten]
@@ -884,6 +922,11 @@ def command_sync(args: argparse.Namespace) -> int:
         print(f"Models relabeled: {result['models_relabeled']} conversation(s) -> {result['target_model']}")
     if result["index_merged"]:
         print(f"session_index.jsonl: merged {result['index_merged']} missing id(s)")
+    if result.get("history_rows_dropped"):
+        print(
+            f"History projection refreshed: {result['history_rows_dropped']} "
+            "cached row(s) dropped"
+        )
     if result["backup_dir"]:
         print(f"Backup: {result['backup_dir']}")
     for error in result["errors"]:
@@ -904,20 +947,173 @@ def command_sync(args: argparse.Namespace) -> int:
 
 REASONING_TYPE = "reasoning"
 
+# Real reasoning items from the official API carry a Fernet-style
+# ``encrypted_content`` blob that starts with ``gAAAAA``. Third-party
+# providers and OpenAI-compatible proxies instead write a placeholder such as
+# ``8ec8e468-e6a3-4513-a1f0-9fbb4f189148-0``; replaying that to the official
+# API fails with "The encrypted content ... could not be verified".
+OPENAI_ENCRYPTED_PREFIX = "gAAAAA"
+
+
+def is_foreign_encrypted_content(value: object) -> bool:
+    """True when ``encrypted_content`` cannot have come from the official API."""
+    if value is None:
+        return False
+    if not isinstance(value, str):
+        return True
+    return not value.startswith(OPENAI_ENCRYPTED_PREFIX)
+
+
+# Tables in ``thread_history_*.sqlite`` that cache the parsed rollout. They are
+# keyed by thread id and rebuilt from the rollout file, so dropping a thread's
+# rows makes Codex re-project it (and recompute its byte offsets) on next read.
+HISTORY_TABLES = (
+    "thread_items",
+    "thread_turns",
+    "thread_realtime_items",
+    "thread_history_projection_state",
+)
+
+
+def pad_line(line: bytes, target_len: int) -> bytes:
+    """Append spaces so ``line`` keeps ``target_len`` bytes.
+
+    Trailing whitespace is insignificant in JSONL, so the line still parses
+    while every downstream byte offset stays valid.
+    """
+    if len(line) > target_len:
+        raise ValueError(
+            f"cannot keep byte length: new line is {len(line)} bytes, "
+            f"original was {target_len}"
+        )
+    return line + b" " * (target_len - len(line))
+
+
+def history_db_path() -> Path | None:
+    """Newest ``thread_history_*.sqlite`` in CODEX_HOME, if any."""
+    candidates = sorted(codex_home().glob("thread_history_*.sqlite"))
+    if not candidates:
+        return None
+
+    def version(path: Path) -> tuple[int, str]:
+        match = re.search(r"thread_history_(\d+)\.sqlite$", path.name)
+        return (int(match.group(1)) if match else -1, path.name)
+
+    return max(candidates, key=version)
+
+
+def backup_file_with_sidecars(path: Path, snap: Path, label: str) -> None:
+    """Copy a sqlite database plus its ``-wal``/``-shm`` sidecars."""
+    for suffix in ("", "-wal", "-shm"):
+        source = Path(f"{path}{suffix}")
+        if source.exists():
+            shutil.copy2(source, snap / f"{label}{suffix}")
+
+
+def rollout_thread_id(path: Path) -> str | None:
+    """Session id recorded in a rollout's first line (``session_meta``)."""
+    try:
+        with path.open("rb") as handle:
+            first = handle.readline()
+        obj = json.loads(first.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    payload = obj.get("payload") if isinstance(obj, dict) else None
+    if not isinstance(payload, dict):
+        return None
+    for key in ("session_id", "id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def rollout_thread_ids(path: Path) -> set[str]:
+    """Every thread id this rollout belongs to.
+
+    A continued session writes ``rollout-<ts>-<sessionId>_<segmentId>.jsonl``.
+    Codex keeps a separate paginated-history cursor for the session id *and*
+    for each continuation segment (``thread_history_*.sqlite`` is keyed by
+    those ids), so a rewrite has to refresh all of them - otherwise the
+    untouched segment cursor points past the shortened file and resuming fails
+    with "cutoff byte offset is past the source rollout".
+    """
+    ids: set[str] = set()
+    session_id = rollout_thread_id(path)
+    if session_id:
+        ids.add(session_id)
+    stem = path.name
+    if stem.endswith(".jsonl"):
+        stem = stem[: -len(".jsonl")]
+    if "_" in stem:
+        segment = stem.rsplit("_", 1)[1]
+        if segment:
+            ids.add(segment)
+    return ids
+
+
+def refresh_history_projection(
+    thread_ids: set[str], snap: Path | None
+) -> tuple[int, list[str]]:
+    """Drop cached history rows so Codex re-reads the rewritten rollouts.
+
+    Returns ``(deleted_rows, errors)``. Errors are reported to the caller as
+    warnings: the rollout repair itself is already durable at that point.
+    """
+    if not thread_ids:
+        return 0, []
+    db = history_db_path()
+    if db is None or not db.exists():
+        return 0, []
+    if snap is not None:
+        try:
+            backup_file_with_sidecars(db, snap, db.name)
+        except OSError as exc:
+            return 0, [f"history db backup failed, projection left untouched: {exc}"]
+    try:
+        conn = sqlite3.connect(db)
+    except sqlite3.Error as exc:
+        return 0, [f"cannot open {db.name}: {exc}"]
+    deleted = 0
+    errors: list[str] = []
+    try:
+        present = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        conn.execute("BEGIN IMMEDIATE")
+        for table in HISTORY_TABLES:
+            if table not in present:
+                continue
+            for thread_id in sorted(thread_ids):
+                cursor = conn.execute(
+                    f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,)
+                )
+                deleted += max(cursor.rowcount, 0)
+        conn.commit()
+    except sqlite3.Error as exc:
+        conn.rollback()
+        errors.append(f"history projection reset failed: {exc}")
+    finally:
+        conn.close()
+    return deleted, errors
+
 
 def all_rollout_paths() -> tuple[list[Path], str | None]:
     """All rollout files plus a warning when the state db could not be read.
 
     Returns (paths, db_warning): paths are sorted and deduplicated from both
-    the sessions tree and the threads table; db_warning is set when the db is
-    present but unreadable, so callers know the list may be incomplete.
+    the active ``sessions`` tree, the ``archived_sessions`` tree, and the
+    threads table; db_warning is set when the db is present but unreadable, so
+    callers know the list may be incomplete.
     """
     paths: dict[Path, None] = {}
     db_warning: str | None = None
-    sessions_dir = codex_home() / "sessions"
-    if sessions_dir.is_dir():
-        for path in sessions_dir.rglob("rollout-*.jsonl"):
-            paths[path] = None
+    for dirname in ("sessions", "archived_sessions"):
+        root = codex_home() / dirname
+        if root.is_dir():
+            for path in root.rglob("rollout-*.jsonl"):
+                paths[path] = None
     db = state_db_path()
     if db.exists():
         conn = connect_state_db_readonly(db)
@@ -940,14 +1136,25 @@ def all_rollout_paths() -> tuple[list[Path], str | None]:
     return sorted(paths), db_warning
 
 
-def resolve_rollout_path(session: str) -> Path:
+def resolve_rollout_paths(session: str) -> list[Path]:
+    """Every rollout matching ``session`` (a session id or a file name).
+
+    One session can own several rollout files: the initial one plus each
+    continued rollout. They share the session id and all need the same repair,
+    so every match is returned instead of failing on an ambiguous match.
+    """
     candidates: list[Path] = []
     seen: set[Path] = set()
-    paths, _db_warning = all_rollout_paths()
-    for path in paths:
-        if session in path.name and path not in seen:
+
+    def add(path: Path) -> None:
+        if path.is_file() and path not in seen:
             candidates.append(path)
             seen.add(path)
+
+    paths, _db_warning = all_rollout_paths()
+    for path in paths:
+        if session in path.name:
+            add(path)
     db = state_db_path()
     if db.exists():
         conn = connect_state_db_readonly(db)
@@ -960,82 +1167,123 @@ def resolve_rollout_path(session: str) -> Path:
             finally:
                 conn.close()
             for _tid, raw in rows:
-                if not raw:
-                    continue
-                path = Path(raw).expanduser()
-                if path.is_file() and path not in seen:
-                    candidates.append(path)
-                    seen.add(path)
+                if raw:
+                    add(Path(raw).expanduser())
     if not candidates:
         raise ValueError(
-            f"No rollout file matches session id '{session}'. "
-            "Pass the full session id (e.g. 019fcb99-1c6f-74c2-a5bb-f390a2013653)."
+            f"No rollout file matches session id '{session}'. Pass the full "
+            "session id (e.g. 019fcb99-1c6f-74c2-a5bb-f390a2013653) or a "
+            "rollout filename."
         )
-    if len(candidates) > 1:
-        names = ", ".join(p.name for p in candidates[:5])
-        raise ValueError(f"Session id '{session}' matches multiple rollouts: {names}")
-    return candidates[0]
+    return candidates
 
 
-def scan_reasoning(path: Path) -> tuple[int, int]:
-    """Return (total reasoning items, reasoning items with non-empty content)."""
-    total = 0
-    bad = 0
+def scan_reasoning(path: Path) -> dict:
+    """Inspect a rollout's reasoning items.
+
+    Returns counters for the two things the official API rejects when history
+    is replayed after a third-party provider switch:
+
+    ``total``             reasoning items seen
+    ``with_content``      plaintext ``content`` (the API wants an empty array)
+    ``foreign_encrypted`` ``encrypted_content`` that is not an official blob
+    """
+    stats = {"total": 0, "with_content": 0, "foreign_encrypted": 0}
     try:
-        lines = path.read_bytes().splitlines()
+        raw = path.read_bytes()
     except OSError:
-        return 0, 0
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        payload = obj.get("payload") if isinstance(obj, dict) else None
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("type") != REASONING_TYPE:
-            continue
-        total += 1
-        content = payload.get("content")
-        if isinstance(content, list) and content:
-            bad += 1
-    return total, bad
-
-
-def rewrite_reasoning_content(path: Path) -> int:
-    """Empty the content array of reasoning items. Returns how many changed."""
-    raw = path.read_bytes()
-    trailing_newline = raw.endswith(b"\n")
-    lines = raw.splitlines()
-    out: list[bytes] = []
-    changed = 0
-    for line in lines:
-        stripped = line.strip()
+        return stats
+    for part in raw.split(b"\n"):
+        stripped = part.strip()
         if not stripped:
-            out.append(line)
             continue
         try:
             obj = json.loads(stripped)
         except json.JSONDecodeError:
-            out.append(line)
             continue
         payload = obj.get("payload") if isinstance(obj, dict) else None
         if not isinstance(payload, dict) or payload.get("type") != REASONING_TYPE:
-            out.append(line)
+            continue
+        stats["total"] += 1
+        content = payload.get("content")
+        if isinstance(content, list) and content:
+            stats["with_content"] += 1
+        if is_foreign_encrypted_content(payload.get("encrypted_content")):
+            stats["foreign_encrypted"] += 1
+    return stats
+
+
+def reasoning_needs_repair(stats: dict) -> bool:
+    return bool(stats["with_content"] or stats["foreign_encrypted"])
+
+
+def rewrite_reasoning_items(path: Path, drop_foreign: bool = False) -> dict:
+    """Make reasoning items replayable by the official API.
+
+    * plaintext ``content`` becomes ``[]`` (the API requires an empty array)
+    * ``encrypted_content`` that is not an official blob is removed (the API
+      cannot verify a placeholder written by a third-party provider)
+
+    Both keep every line at its original byte length by padding with spaces, so
+    Codex's byte offsets stay valid. ``drop_foreign`` removes those reasoning
+    lines entirely instead, which *does* shrink the file; the caller must then
+    refresh the cached history projection.
+
+    Returns counters: ``content_emptied``, ``encrypted_stripped``,
+    ``lines_dropped`` and ``padding_bytes``.
+    """
+    raw = path.read_bytes()
+    parts = raw.split(b"\n")
+    out: list[bytes] = []
+    result = {
+        "content_emptied": 0,
+        "encrypted_stripped": 0,
+        "lines_dropped": 0,
+        "padding_bytes": 0,
+    }
+    for part in parts:
+        stripped = part.strip()
+        if not stripped:
+            out.append(part)
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            out.append(part)
+            continue
+        payload = obj.get("payload") if isinstance(obj, dict) else None
+        if not isinstance(payload, dict) or payload.get("type") != REASONING_TYPE:
+            out.append(part)
             continue
         content = payload.get("content")
-        if not (isinstance(content, list) and content):
-            out.append(line)
+        has_content = isinstance(content, list) and bool(content)
+        foreign = is_foreign_encrypted_content(payload.get("encrypted_content"))
+        if not has_content and not foreign:
+            out.append(part)
             continue
-        payload["content"] = []
-        out.append(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        changed += 1
-    new_raw = b"\n".join(out) + (b"\n" if trailing_newline else b"")
-    path.write_bytes(new_raw)
-    return changed
+        if drop_foreign and foreign:
+            result["lines_dropped"] += 1
+            continue
+        carriage_return = b"\r" if part.endswith(b"\r") else b""
+        body_limit = len(part) - len(carriage_return)
+        if has_content:
+            payload["content"] = []
+            result["content_emptied"] += 1
+        if foreign:
+            payload.pop("encrypted_content", None)
+            result["encrypted_stripped"] += 1
+        body = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        out.append(pad_line(body, body_limit) + carriage_return)
+        result["padding_bytes"] += body_limit - len(body)
+    new_raw = b"\n".join(out)
+    if not result["lines_dropped"] and len(new_raw) != len(raw):
+        raise ValueError(
+            f"{path.name}: refusing to write, byte length would change "
+            f"({len(raw)} -> {len(new_raw)})"
+        )
+    if new_raw != raw:
+        path.write_bytes(new_raw)
+    return result
 
 
 def backup_rollouts(paths: list[Path]) -> Path:
@@ -1060,27 +1308,75 @@ def backup_rollouts(paths: list[Path]) -> Path:
     return snap
 
 
-def scan_all_rollouts() -> tuple[list[tuple[Path, int, int]], str | None]:
+def scan_all_rollouts() -> tuple[list[tuple[Path, dict]], str | None]:
     """Return (repair plan, db warning) across every rollout."""
     paths, db_warning = all_rollout_paths()
     plan = []
     for path in paths:
-        total, bad = scan_reasoning(path)
-        if bad:
-            plan.append((path, total, bad))
+        stats = scan_reasoning(path)
+        if reasoning_needs_repair(stats):
+            plan.append((path, stats))
     return plan, db_warning
 
 
-def apply_repairs(plan: list[tuple[Path, int, int]]) -> tuple[Path, int]:
-    """Back up and repair every rollout in ``plan``. Returns (backup_dir, changed)."""
-    snap = backup_rollouts([path for path, _, _ in plan])
-    changed = 0
-    for path, _total, bad in plan:
-        repaired = rewrite_reasoning_content(path)
-        changed += repaired
-        if repaired != bad:
-            raise ValueError(f"{path.name}: expected {bad} changes, applied {repaired}")
-    return snap, changed
+def apply_repairs(
+    plan: list[tuple[Path, dict]],
+    refresh_history: bool = True,
+    drop_foreign: bool = False,
+) -> dict:
+    """Back up, repair, and re-project every rollout in ``plan``.
+
+    Returns a summary dict with ``backup``, ``rollouts``, ``content_emptied``,
+    ``encrypted_stripped``, ``lines_dropped``, ``padding_bytes`` and
+    ``projection_rows_dropped``. Unless ``drop_foreign`` is set, every file is
+    verified to keep its exact byte size before the cached history projection
+    is refreshed.
+    """
+    snap = backup_rollouts([path for path, _ in plan])
+    totals = {
+        "content_emptied": 0,
+        "encrypted_stripped": 0,
+        "lines_dropped": 0,
+        "padding_bytes": 0,
+    }
+    thread_ids: set[str] = set()
+    for path, stats in plan:
+        size_before = path.stat().st_size
+        result = rewrite_reasoning_items(path, drop_foreign=drop_foreign)
+        if result["content_emptied"] != stats["with_content"]:
+            raise ValueError(
+                f"{path.name}: expected {stats['with_content']} content fix(es), "
+                f"applied {result['content_emptied']}"
+            )
+        expected_foreign = stats["foreign_encrypted"]
+        handled_foreign = (
+            result["lines_dropped"] if drop_foreign else result["encrypted_stripped"]
+        )
+        if handled_foreign != expected_foreign:
+            raise ValueError(
+                f"{path.name}: expected {expected_foreign} foreign encrypted "
+                f"item(s), handled {handled_foreign}"
+            )
+        size_after = path.stat().st_size
+        if not drop_foreign and size_after != size_before:
+            raise ValueError(
+                f"{path.name}: byte length changed ({size_before} -> {size_after}); "
+                f"restore from {snap}"
+            )
+        for key, value in result.items():
+            totals[key] += value
+        thread_ids.update(rollout_thread_ids(path))
+    dropped_rows = 0
+    if refresh_history:
+        dropped_rows, errors = refresh_history_projection(thread_ids, snap)
+        for error in errors:
+            print(f"WARNING: {error}", file=sys.stderr)
+    return {
+        "backup": snap,
+        "rollouts": len(plan),
+        "projection_rows_dropped": dropped_rows,
+        **totals,
+    }
 
 
 def command_repair(args: argparse.Namespace) -> int:
@@ -1091,31 +1387,49 @@ def command_repair(args: argparse.Namespace) -> int:
         print("Specify a session id or --all.", file=sys.stderr)
         return 2
 
+    if args.drop_foreign_reasoning and args.no_refresh_history:
+        print(
+            "--drop-foreign-reasoning removes lines, so the cached history "
+            "projection must be refreshed; drop --no-refresh-history.",
+            file=sys.stderr,
+        )
+        return 2
+
     if args.all:
         plan, db_warning = scan_all_rollouts()
         if db_warning:
             print(f"WARNING: {db_warning}", file=sys.stderr)
+        matched = len(all_rollout_paths()[0])
+        print(f"Rollouts scanned: {matched}")
     else:
         try:
-            path = resolve_rollout_path(args.session)
+            paths = resolve_rollout_paths(args.session)
         except ValueError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
-        total, bad = scan_reasoning(path)
-        plan = [(path, total, bad)] if bad else []
+        matched = len(paths)
+        print(f"Rollouts matched for '{args.session}': {matched}")
+        for path in paths:
+            print(f"  {path.name}")
+        plan = []
+        for path in paths:
+            stats = scan_reasoning(path)
+            if reasoning_needs_repair(stats):
+                plan.append((path, stats))
 
-    scanned = len(all_rollout_paths()[0]) if args.all else 1
-    print(f"Sessions scanned: {scanned}")
-    print(f"Sessions to repair: {len(plan)}")
-    for path, total, bad in plan:
+    print(f"Rollouts to repair: {len(plan)}")
+    for path, stats in plan:
         print(
-            f"  {path.name}: {bad} reasoning item(s) with content to empty "
-            f"(of {total} reasoning item(s))"
+            f"  {path.name}: {stats['with_content']} reasoning item(s) with content "
+            f"to empty, {stats['foreign_encrypted']} with a non-OpenAI "
+            f"encrypted_content (of {stats['total']} reasoning item(s))"
         )
 
     if args.dry_run or not plan:
         if args.dry_run:
             print("Dry run: no files were changed.")
+        else:
+            print("Nothing to repair: every reasoning item already has empty content.")
         return 0
 
     if is_codex_running() and not args.force:
@@ -1129,7 +1443,8 @@ def command_repair(args: argparse.Namespace) -> int:
 
     if not args.yes:
         answer = input(
-            f"Empty reasoning content in {len(plan)} session(s)? "
+            f"Rewrite {len(plan)} rollout(s) (empty reasoning content, remove "
+            "non-OpenAI encrypted_content)? "
             "A backup is created first. [y/N] "
         ).strip().lower()
         if answer not in ("y", "yes"):
@@ -1137,16 +1452,46 @@ def command_repair(args: argparse.Namespace) -> int:
             return 0
 
     try:
-        snap, changed = apply_repairs(plan)
+        summary = apply_repairs(
+            plan,
+            refresh_history=not args.no_refresh_history,
+            drop_foreign=args.drop_foreign_reasoning,
+        )
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: repair failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Repaired: {changed} reasoning item(s) in {len(plan)} session(s)")
-    print(f"Backup: {snap}")
-    remaining = sum(scan_reasoning(path)[1] for path, _, _ in plan)
-    if remaining:
-        print(f"WARNING: {remaining} reasoning item(s) still have content", file=sys.stderr)
+    print(f"Repaired {summary['rollouts']} rollout(s):")
+    print(f"  reasoning content emptied        : {summary['content_emptied']}")
+    print(f"  foreign encrypted_content removed: {summary['encrypted_stripped']}")
+    if summary["lines_dropped"]:
+        print(f"  reasoning lines dropped          : {summary['lines_dropped']}")
+    if args.drop_foreign_reasoning:
+        print(
+            "Byte lengths changed because lines were dropped; the cached "
+            "history projection was refreshed so Codex re-reads these files."
+        )
+    else:
+        print(
+            f"Byte lengths preserved: {summary['padding_bytes']} padding byte(s) "
+            "added, file sizes unchanged"
+        )
+    if args.no_refresh_history:
+        print("History projection refresh skipped (--no-refresh-history).")
+    else:
+        print(
+            f"History projection refreshed: {summary['projection_rows_dropped']} "
+            "cached row(s) dropped (Codex will re-read these rollouts)"
+        )
+    print(f"Backup: {summary['backup']}")
+    left_content = sum(scan_reasoning(path)["with_content"] for path, _ in plan)
+    left_encrypted = sum(scan_reasoning(path)["foreign_encrypted"] for path, _ in plan)
+    if left_content or left_encrypted:
+        print(
+            f"WARNING: {left_content} reasoning item(s) still have content and "
+            f"{left_encrypted} still carry a foreign encrypted_content",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
@@ -1322,13 +1667,17 @@ def command_openai(args: argparse.Namespace) -> int:
             print(f"WARNING: {db_warning}", file=sys.stderr)
         if repair_plan:
             try:
-                snap, changed = apply_repairs(repair_plan)
+                summary = apply_repairs(repair_plan)
             except Exception as exc:  # noqa: BLE001
                 print(f"ERROR: session history repair failed: {exc}", file=sys.stderr)
             else:
                 print(
-                    f"Repaired {len(repair_plan)} session(s), {changed} reasoning item(s) "
-                    f"(backup: {snap})."
+                    f"Repaired {summary['rollouts']} rollout(s): "
+                    f"{summary['content_emptied']} reasoning content, "
+                    f"{summary['encrypted_stripped']} foreign encrypted_content, "
+                    f"{summary['padding_bytes']} padding byte(s), "
+                    f"{summary['projection_rows_dropped']} cached history row(s) "
+                    f"dropped (backup: {summary['backup']})."
                 )
         else:
             print("No session history needs repair for the OpenAI switch.")
@@ -1483,6 +1832,19 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--all", action="store_true", help="Repair every affected rollout")
     repair.add_argument("--dry-run", action="store_true", help="Only show what would change")
     repair.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    repair.add_argument(
+        "--no-refresh-history",
+        action="store_true",
+        help="Do not drop Codex's cached history projection for these rollouts",
+    )
+    repair.add_argument(
+        "--drop-foreign-reasoning",
+        action="store_true",
+        help=(
+            "Delete reasoning items whose encrypted_content is not from the "
+            "official API instead of stripping the field (changes file size)"
+        ),
+    )
     repair.add_argument(
         "--force",
         action="store_true",

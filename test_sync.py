@@ -516,7 +516,7 @@ def main() -> None:
             # dry-run: reports both sessions, changes nothing
             r = run("repair", "--all", "--dry-run", home=home5)
             check(r.returncode == 0, f"repair --all --dry-run exit 0 (got {r.returncode})")
-            check("Sessions to repair: 2" in r.stdout, "dry-run finds 2 sessions")
+            check("Rollouts to repair: 2" in r.stdout, "dry-run finds 2 rollouts")
             check("Dry run: no files were changed." in r.stdout, "repair dry-run changes nothing")
             after_dry = a_path.read_text(encoding="utf-8")
             check('"text": "thinking 0"' in after_dry, "dry-run left reasoning content intact")
@@ -524,7 +524,7 @@ def main() -> None:
             # repair one session by id
             r = run("repair", "task-aaa", "-y", home=home5)
             check(r.returncode == 0, f"repair by id exit 0 (got {r.returncode}, {r.stderr})")
-            check("Repaired: 3 reasoning item(s) in 1 session(s)" in r.stdout, "repair reports 3 items")
+            check("Repaired 1 rollout(s)" in r.stdout and "reasoning content emptied        : 3" in r.stdout, "repair reports 3 items")
             check("Backup:" in r.stdout, "repair reports backup")
             a_text = a_path.read_text(encoding="utf-8")
             check('"text": "thinking 0"' not in a_text, "reasoning text removed")
@@ -555,12 +555,12 @@ def main() -> None:
             # idempotent
             r = run("repair", "task-aaa", "-y", home=home5)
             check(r.returncode == 0, "second repair exit 0")
-            check("Sessions to repair: 0" in r.stdout, "second repair is a no-op")
+            check("Rollouts to repair: 0" in r.stdout, "second repair is a no-op")
 
             # --all repairs the remaining session
             r = run("repair", "--all", "-y", home=home5)
             check(r.returncode == 0, "repair --all exit 0")
-            check("Repaired: 1 reasoning item(s) in 1 session(s)" in r.stdout, "repair --all fixes remaining")
+            check("Repaired 1 rollout(s)" in r.stdout and "reasoning content emptied        : 1" in r.stdout, "repair --all fixes remaining")
             c_text = c_path.read_text(encoding="utf-8")
             check('"text": "thinking 0"' not in c_text, "second session reasoning emptied")
 
@@ -580,12 +580,24 @@ def main() -> None:
             with mock.patch.dict(os.environ, {"CODEX_SWITCH_HOME": str(home5)}):
                 with mock.patch.object(mod5, "is_codex_running", return_value=True):
                     ns = argparse.Namespace(
-                        all=False, session="task-aaa", dry_run=False, yes=True, force=False
+                        all=False,
+                        session="task-aaa",
+                        dry_run=False,
+                        yes=True,
+                        force=False,
+                        no_refresh_history=False,
+                        drop_foreign_reasoning=False,
                     )
                     check(mod5.command_repair(ns) == 3, "repair refuses while running")
                 with mock.patch.object(mod5, "is_codex_running", return_value=True):
                     ns = argparse.Namespace(
-                        all=False, session="task-aaa", dry_run=False, yes=True, force=True
+                        all=False,
+                        session="task-aaa",
+                        dry_run=False,
+                        yes=True,
+                        force=True,
+                        no_refresh_history=False,
+                        drop_foreign_reasoning=False,
                     )
                     check(mod5.command_repair(ns) == 0, "repair --force proceeds while running")
 
@@ -602,7 +614,7 @@ def main() -> None:
             )
             r = run("openai", home=home6)
             check(r.returncode == 0, f"openai switch with auto-repair exit 0 (got {r.returncode})")
-            check("Repaired 1 session(s), 2 reasoning item(s)" in r.stdout, "auto-repair reported")
+            check("Repaired 1 rollout(s): 2 reasoning content" in r.stdout, "auto-repair reported")
             a_text = a_path.read_text(encoding="utf-8")
             check('"text": "thinking 0"' not in a_text, "auto-repair emptied reasoning content")
             cfg = (home6 / "config.toml").read_text(encoding="utf-8")
@@ -750,10 +762,12 @@ def main() -> None:
                                 dry_run=True,
                                 yes=True,
                                 force=False,
+                                no_refresh_history=False,
+                                drop_foreign_reasoning=False,
                             )
                         )
                     check(code == 0, f"repair dry-run with locked db exits 0 (got {code})")
-                    check("Sessions to repair: 1" in out.getvalue(), "repair still scans files")
+                    check("Rollouts to repair: 1" in out.getvalue(), "repair still scans files")
                     check("WARNING" in err.getvalue(), "repair prints db warning")
 
                     out, err = io.StringIO(), io.StringIO()
