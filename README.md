@@ -41,18 +41,85 @@ invalid paginated history lineage for <会话id>: cutoff byte offset is past the
 
 ## 安装
 
-需要 Go 1.25 或更高版本。
+### 前置条件
+
+- Go 1.25 或更高版本。用 `go version` 确认；没有的话，macOS 可以 `brew install go`，其他系统从 <https://go.dev/dl/> 下载。
+- 本机就是你在用 Codex 的那台机器，也就是存在 `~/.codex/` 目录的机器。
+- 不需要 cgo，也不需要 C 编译器：SQLite 走的是纯 Go 驱动。
+
+### 第一步：取得代码
+
+```bash
+git clone https://github.com/white-x-7/codex-session-doctor.git
+cd codex-session-doctor
+
+# 仓库是私有的，clone 时会要求 GitHub 登录：HTTPS 用 token，
+# 或者换成 SSH 地址 git@github.com:white-x-7/codex-session-doctor.git
+
+# 重构先在 feat/go-rewrite 分支上完成，还没有合并进 main。
+# 如果 ls cmd 看不到目录，就显式切过去；
+# 等 main 里已经有 cmd/ 之后，这一行可以省略。
+git checkout feat/go-rewrite
+
+# 确认拿到的是 Go 版本：下面两条都应该有输出
+ls go.mod cmd
+```
+
+### 第二步：编译并安装
+
+以下命令都要在**仓库根目录**（能看到 `go.mod` 的那一层）执行。三选一：
 
 ```bash
 # 方式一：一键安装到 ~/.local/bin
 bash install.sh
 
-# 方式二：用 make
+# 装到别的前缀（会放到 <前缀>/bin 下；装到 /usr/local 需要 sudo）
+bash install.sh --prefix /usr/local
+
+# 方式二：用 make（等价于上面两条）
 make install PREFIX="$HOME/.local"
 
-# 方式三：只编译，不安装
-make build        # 生成当前目录下的 codex-session-doctor
+# 方式三：只编译，不安装，在当前目录生成 ./codex-session-doctor
+make build
 ```
+
+上面两种安装方式都会调用 `go build` 编译，再把二进制复制到目标目录，不需要事先手动设置 `GOPATH` 之类的环境变量；首次编译会联网下载依赖模块。
+
+### 第三步：确认装好了
+
+```bash
+codex-session-doctor version
+```
+
+如果提示 `command not found`，说明安装目录不在 `PATH` 里。`install.sh` 检测到这种情况时会打印提示，按提示把下面的内容加到 shell 配置即可（zsh 为例）：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 第四步：确认能读到 Codex 数据
+
+```bash
+codex-session-doctor doctor
+```
+
+能打印出下面这几项，就说明环境正常，可以进入下面的「使用」：
+
+```text
+Codex 主目录 : /Users/你的用户名/.codex
+进程状态     : 未运行
+state 数据库 : 可读（state_5.sqlite）
+rollout 总数 : 331 个（其中需要修复：6 个）
+历史投影库   : thread_history_1.sqlite
+备份目录     : /Users/你的用户名/.codex/backups/codex-session-doctor
+```
+
+如果 `state 数据库` 那一行显示「未找到（仅按 sessions 目录扫描）」，通常是这台机器还没跑过 Codex，或者 `~/.codex/` 在别的位置（用 `CODEX_HOME` 指过去）。这时工具仍能按目录扫描，只是列表可能不全。
+
+### Windows
+
+`go build -o codex-session-doctor.exe ./cmd/codex-session-doctor` 编译后，把生成的 `.exe` 放到任意一个已在 `PATH` 里的目录即可，命令用法与 macOS、Linux 相同。`install.sh` 与 `Makefile` 依赖 POSIX shell，Windows 下请直接使用上面这条 `go build`。
 
 ## 使用
 
@@ -114,7 +181,9 @@ codex-session-doctor repair --all -y
 - **字节长度不变。** 正常修复通过补空格保持每一行的原始长度，因此 Codex 缓存的字节偏移继续有效。万一重写后变长，工具会直接报错并放弃写入，而不是写出一个偏移失效的文件。
 - **运行中拒绝写入。** 桌面端正在运行时可能覆盖写这些文件，工具会检测并返回退出码 3，提示你先退出 Codex。
 - **只碰该碰的字段。** 无关的行按字节原样保留；数字按原始字面量输出，避免大整数被浮点化。
+- **原子写入。** 改写后的 rollout 先写同目录临时文件再改名覆盖，即使中途被打断也不会留下残缺文件；文件权限保持原样。
 - **备份失败就不动手。** 历史投影库备份失败时，工具会保留数据库原样并给出警告。
+- **不悄悄跳过。** 读不了的 rollout 会作为警告列出来，而不是从待修列表里静默消失。
 
 回滚方法见 [docs/rollback.md](docs/rollback.md)。
 
@@ -129,8 +198,18 @@ codex-session-doctor repair --all -y
 | 切回官方服务商 | 有 | 已移除 |
 | 同步历史标签 / 会话模型 | 有 | 已移除 |
 | 存储 API Key | 有 | 已移除 |
+| `status`（查看当前服务商） | 有 | 已移除，改为 `doctor` 体检会话状态 |
+| `is-running`（检测桌面端是否运行） | 有 | 已移除，改为 `doctor` 输出里的「进程状态」一行 |
+| 一键发布脚本 `push-all.sh` | 有 | 已移除 |
 | 语言 | Python | Go |
 | 配套界面 | macOS JXA 应用、PowerShell 菜单 | 已移除，只保留命令行 |
+
+## 从上游迁移过来的注意事项
+
+如果你之前用的是上游 `codex-api-switch`，有两点变化需要留意：
+
+- **备份目录换了位置**：新工具的备份写在 `~/.codex/backups/codex-session-doctor/`。上游写的 `~/.codex/backups/codex-api-switch/` 不会被自动读取或删除，里面的快照仍然可以按老路径手动回滚。
+- **隔离环境变量改了名**：`CODEX_SWITCH_HOME` 换成 `CODEX_SESSION_DOCTOR_HOME`。如果你有依赖旧变量名的脚本（比如用模拟目录做测试的脚本），需要同步改掉；调用命令行修复的脚本一般不受影响。
 
 ## 开发
 
