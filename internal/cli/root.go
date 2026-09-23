@@ -48,6 +48,10 @@ func Run(env Env) int {
 	if env.Stderr == nil {
 		env.Stderr = io.Discard
 	}
+	// 未提供标准输入时给一个空输入，避免确认提示读到 nil 而崩溃。
+	if env.Stdin == nil {
+		env.Stdin = strings.NewReader("")
+	}
 	command, rest := nextCommand(env.Args)
 	switch command {
 	case "":

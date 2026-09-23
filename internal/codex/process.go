@@ -1,6 +1,7 @@
 package codex
 
 import (
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -10,6 +11,9 @@ import (
 
 // commandTimeout 限制外部检测命令的等待时间。
 const commandTimeout = 5 * time.Second
+
+// ErrTimeout 表示检测命令超时，与"命令不存在"是两回事。
+var ErrTimeout = errors.New("检测命令执行超时")
 
 // IsRunning 判断 Codex 桌面端是否正在运行。
 //
@@ -86,6 +90,6 @@ func runCommand(name string, args ...string) (string, error) {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		return "", exec.ErrNotFound
+		return "", ErrTimeout
 	}
 }

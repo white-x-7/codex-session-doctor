@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // Result 记录一次重写的改动量。
@@ -128,9 +129,45 @@ func Rewrite(path string, dropForeign bool) (Result, error) {
 			"%s: 拒绝写入，字节长度会变化（%d -> %d）", path, originalSize, len(newRaw))
 	}
 	if !bytes.Equal(newRaw, raw) {
-		if err := os.WriteFile(path, newRaw, 0o644); err != nil {
+		if err := writeFileAtomic(path, newRaw); err != nil {
 			return result, err
 		}
 	}
 	return result, nil
+}
+
+// writeFileAtomic 先写同目录下的临时文件，再改名覆盖目标。
+//
+// 直接原地截断重写时，如果进程在写到一半时被中断（Ctrl-C、断电、系统回收），
+// 用户的历史文件会留下一个被截断的残缺版本。改名在同一文件系统内是原子操作，
+// 要么是旧内容，要么是完整的新内容。
+func writeFileAtomic(path string, data []byte) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	// 改名成功后这里已经不存在，删除失败无需处理。
+	defer func() { _ = os.Remove(tempName) }()
+
+	if _, err := temp.Write(data); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Chmod(info.Mode().Perm()); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tempName, path)
 }

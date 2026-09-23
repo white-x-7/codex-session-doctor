@@ -164,6 +164,37 @@ func TestRewriteDropForeignRemovesLines(t *testing.T) {
 	}
 }
 
+func TestRewritePreservesFileModeAndLeavesNoTempFiles(t *testing.T) {
+	path, _ := buildRollout(t)
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("设置权限失败：%v", err)
+	}
+
+	if _, err := Rewrite(path, false); err != nil {
+		t.Fatalf("修复失败：%v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("读取文件信息失败：%v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Errorf("修复不应改变文件权限，期望 0600，实际 %#o", got)
+	}
+
+	// 原子写入用的是同目录临时文件，成功后必须清理干净，
+	// 否则会在用户的 sessions 目录里留下垃圾文件。
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("读取目录失败：%v", err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Errorf("残留了临时文件：%s", entry.Name())
+		}
+	}
+}
+
 // readLines 读取文件并按行切分。
 func readLines(t *testing.T, path string) []string {
 	t.Helper()

@@ -48,7 +48,7 @@ func runDoctor(env Env, args []string) int {
 		fmt.Fprintf(env.Stdout, "state 数据库 : 可读（%s）\n", filepath.Base(dbPath))
 	}
 
-	plans, scanned, warning := repair.ScanAll(home)
+	plans, scanned, warnings := repair.ScanAll(home)
 	fmt.Fprintf(env.Stdout, "rollout 总数 : %d 个（其中需要修复：%d 个）\n", scanned, len(plans))
 	for _, plan := range plans {
 		fmt.Fprintf(env.Stdout,
@@ -63,7 +63,7 @@ func runDoctor(env Env, args []string) int {
 	}
 	fmt.Fprintf(env.Stdout, "备份目录     : %s\n", codex.BackupDir(home))
 
-	if warning != "" {
+	for _, warning := range warnings {
 		fmt.Fprintf(env.Stderr, "警告：%s\n", warning)
 	}
 	return ExitOK

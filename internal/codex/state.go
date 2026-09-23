@@ -24,8 +24,11 @@ func OpenReadOnly(path string) (*sql.DB, error) {
 }
 
 // OpenReadWrite 以读写方式打开数据库，用于清理历史投影缓存。
+//
+// 使用 mode=rw 而不是 rwc：数据库不存在时应当报错，而不是凭空创建一个空的
+// thread_history_*.sqlite 干扰 Codex。
 func OpenReadWrite(path string) (*sql.DB, error) {
-	return openWithRetry(path, "mode=rwc&_pragma=busy_timeout(5000)")
+	return openWithRetry(path, "mode=rw&_pragma=busy_timeout(5000)")
 }
 
 func openWithRetry(path string, params string) (*sql.DB, error) {

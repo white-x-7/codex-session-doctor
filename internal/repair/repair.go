@@ -43,26 +43,35 @@ type ApplyOptions struct {
 	DropForeign bool
 }
 
-// ScanAll 扫描全部 rollout，返回需要修复的清单、扫描总数与数据库警告。
-func ScanAll(home string) ([]Plan, int, string) {
+// ScanAll 扫描全部 rollout，返回需要修复的清单、扫描总数与警告列表。
+func ScanAll(home string) ([]Plan, int, []string) {
 	paths, warning := AllRolloutPaths(home)
-	plans := PlanFor(paths)
-	return plans, len(paths), warning
+	plans, scanWarnings := PlanFor(paths)
+	if warning != "" {
+		scanWarnings = append([]string{warning}, scanWarnings...)
+	}
+	return plans, len(paths), scanWarnings
 }
 
 // PlanFor 过滤出真正需要修复的 rollout。
-func PlanFor(paths []string) []Plan {
+//
+// 读不了的文件不能悄悄跳过：用户会以为"没有需要修复的会话"，实际上只是没读到。
+// 这类文件作为警告返回。
+func PlanFor(paths []string) ([]Plan, []string) {
 	var plans []Plan
+	var warnings []string
 	for _, path := range paths {
 		stats, err := rollout.Scan(path)
 		if err != nil {
+			warnings = append(warnings, fmt.Sprintf(
+				"跳过无法读取的 rollout %s：%v", filepath.Base(path), err))
 			continue
 		}
 		if rollout.NeedsRepair(stats) {
 			plans = append(plans, Plan{Path: path, Stats: stats})
 		}
 	}
-	return plans
+	return plans, warnings
 }
 
 // AllRolloutPaths 返回全部 rollout 文件。
@@ -183,35 +192,35 @@ func Apply(plans []Plan, opts ApplyOptions) (Summary, error) {
 	for _, plan := range plans {
 		sizeBefore, err := fileSize(plan.Path)
 		if err != nil {
-			return summary, err
+			return summary, withBackup(err, dir)
 		}
 		result, err := rollout.Rewrite(plan.Path, opts.DropForeign)
 		if err != nil {
-			return summary, err
+			return summary, withBackup(err, dir)
 		}
 		if result.ContentEmptied != plan.Stats.WithContent {
-			return summary, fmt.Errorf(
+			return summary, withBackup(fmt.Errorf(
 				"%s：预期清空 %d 处明文，实际 %d 处",
-				filepath.Base(plan.Path), plan.Stats.WithContent, result.ContentEmptied)
+				filepath.Base(plan.Path), plan.Stats.WithContent, result.ContentEmptied), dir)
 		}
 		handled := result.EncryptedStripped
 		if opts.DropForeign {
 			handled = result.LinesDropped
 		}
 		if handled != plan.Stats.ForeignEncrypted {
-			return summary, fmt.Errorf(
+			return summary, withBackup(fmt.Errorf(
 				"%s：预期处理 %d 处非官方加密内容，实际 %d 处",
-				filepath.Base(plan.Path), plan.Stats.ForeignEncrypted, handled)
+				filepath.Base(plan.Path), plan.Stats.ForeignEncrypted, handled), dir)
 		}
 		if !result.SizeChanged() {
 			sizeAfter, err := fileSize(plan.Path)
 			if err != nil {
-				return summary, err
+				return summary, withBackup(err, dir)
 			}
 			if sizeAfter != sizeBefore {
-				return summary, fmt.Errorf(
-					"%s：字节长度发生变化（%d -> %d）；可从 %s 回滚",
-					filepath.Base(plan.Path), sizeBefore, sizeAfter, dir)
+				return summary, withBackup(fmt.Errorf(
+					"%s：字节长度发生变化（%d -> %d）",
+					filepath.Base(plan.Path), sizeBefore, sizeAfter), dir)
 			}
 		}
 		summary.Rollouts++
@@ -235,6 +244,17 @@ func Apply(plans []Plan, opts ApplyOptions) (Summary, error) {
 		summary.Warnings = append(summary.Warnings, warnings...)
 	}
 	return summary, nil
+}
+
+// withBackup 在错误里附上快照路径，让用户知道从哪里回滚。
+//
+// 修复是逐个文件进行的，中途报错时前面几个文件可能已经改写，因此错误信息
+// 必须带上回滚点。
+func withBackup(err error, dir string) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w（本次改动的快照在 %s，可从这里回滚）", err, dir)
 }
 
 // fileSize 返回文件大小。

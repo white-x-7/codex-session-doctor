@@ -59,9 +59,9 @@ func runRepair(env Env, args []string) int {
 	var plans []repair.Plan
 	if *all {
 		var scanned int
-		var warning string
-		plans, scanned, warning = repair.ScanAll(home)
-		if warning != "" {
+		var warnings []string
+		plans, scanned, warnings = repair.ScanAll(home)
+		for _, warning := range warnings {
 			fmt.Fprintf(env.Stderr, "警告：%s\n", warning)
 		}
 		fmt.Fprintf(env.Stdout, "已扫描 rollout：%d 个\n", scanned)
@@ -75,7 +75,11 @@ func runRepair(env Env, args []string) int {
 		for _, path := range paths {
 			fmt.Fprintf(env.Stdout, "  %s\n", filepath.Base(path))
 		}
-		plans = repair.PlanFor(paths)
+		var warnings []string
+		plans, warnings = repair.PlanFor(paths)
+		for _, warning := range warnings {
+			fmt.Fprintf(env.Stderr, "警告：%s\n", warning)
+		}
 	}
 
 	fmt.Fprintf(env.Stdout, "需要修复的 rollout：%d 个\n", len(plans))
