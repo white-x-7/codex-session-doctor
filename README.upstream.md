@@ -4,11 +4,6 @@
 
 > 非 OpenAI 官方工具。仅支持 macOS（桌面应用部分），CLI 部分跨平台。
 
-本仓库是基于上游项目的私有维护版本。上游来源、导入提交和本地改动记录见
-[`UPSTREAM.md`](UPSTREAM.md)，未修改的上游说明保留在
-[`README.upstream.md`](README.upstream.md)。会话修复的完整操作步骤见
-[`docs/repair.md`](docs/repair.md)，回滚方法见 [`docs/rollback.md`](docs/rollback.md)。
-
 ## 为什么需要这个工具
 
 Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任务列表。切换服务商后，之前在其他服务商下创建的会话会从侧边栏"消失"——**数据并没有丢**，只是被过滤隐藏了（相关 issue：openai/codex #31625，官方尚未修复）。
@@ -42,7 +37,7 @@ Invalid 'input[7].content': array too long. Expected an array with maximum lengt
 - `deepseek`：切到 DeepSeek Responses API（自动写 `config.toml` 与模型目录）
 - `openai`：从恢复点还原 OpenAI 配置，并自动修复历史中的明文推理内容
 - `sync`：把全部用户主任务的历史标签同步为当前服务商，并同步会话级模型（自动备份，可回滚）
-- `repair`：备份并修复会话文件里不兼容的 `reasoning` 内容，同时处理多 rollout 会话、伪造 `encrypted_content` 和历史投影缓存
+- `repair`：备份并清空会话文件里 `reasoning` 项的明文 `content`，修复 `array too long` 报错
 - `status` / `status --json`：查看当前配置与运行状态
 - `is-running`：检测 Codex 桌面端是否在运行
 - 桌面应用（JXA）：`Codex_API_切换.app.js` 编译成 macOS App，双击即可操作
@@ -131,9 +126,8 @@ codex-api-switch sync
 
 # 排查 / 修复 array too long：
 codex-api-switch repair --all --dry-run   # 先只看哪些会话需要修复
-codex-api-switch repair <会话id> --dry-run # 预览指定会话（只读）
-codex-api-switch repair <会话id> -y        # 修复指定会话（自动备份）
-codex-api-switch repair --all -y           # 修复全部受影响会话（自动备份）
+codex-api-switch repair <会话id>           # 修复指定会话（自动备份）
+codex-api-switch repair --all              # 修复全部受影响会话（自动备份）
 ```
 
 桌面应用使用流程：
