@@ -12,6 +12,10 @@ import (
 
 // runRepair 实现 repair 子命令。
 func runRepair(env Env, args []string) int {
+	if hasHelpFlag(args) {
+		printRepairUsage(env.Stdout)
+		return ExitOK
+	}
 	flags, positionals := splitArgs(args)
 	fs := flag.NewFlagSet("repair", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
