@@ -52,18 +52,9 @@ invalid paginated history lineage for <会话id>: cutoff byte offset is past the
 ```bash
 git clone https://github.com/white-x-7/codex-session-doctor.git
 cd codex-session-doctor
-
-# 仓库是私有的，clone 时会要求 GitHub 登录：HTTPS 用 token，
-# 或者换成 SSH 地址 git@github.com:white-x-7/codex-session-doctor.git
-
-# 重构先在 feat/go-rewrite 分支上完成，还没有合并进 main。
-# 如果 ls cmd 看不到目录，就显式切过去；
-# 等 main 里已经有 cmd/ 之后，这一行可以省略。
-git checkout feat/go-rewrite
-
-# 确认拿到的是 Go 版本：下面两条都应该有输出
-ls go.mod cmd
 ```
+
+接下来所有命令都在这个目录里执行，也就是能看到 `go.mod` 和 `cmd` 的那一层。
 
 ### 第二步：编译并安装
 
