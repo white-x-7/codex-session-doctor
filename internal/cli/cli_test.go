@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,6 +258,101 @@ func TestVersionAndUnknownCommand(t *testing.T) {
 	if code, _, _ := f.run(t, false, "nope"); code != ExitUsage {
 		t.Errorf("未知子命令应返回 %d，实际 %d", ExitUsage, code)
 	}
+}
+
+func TestHelpCommands(t *testing.T) {
+	f := newFixture(t)
+	cases := []struct {
+		name       string
+		args       []string
+		wantOutput string
+		wantCode   int
+	}{
+		{name: "top level", args: []string{"help"}, wantOutput: "check-update", wantCode: ExitOK},
+		{name: "repair topic", args: []string{"help", "repair"}, wantOutput: "--drop-foreign-reasoning", wantCode: ExitOK},
+		{name: "repair flag", args: []string{"repair", "--help"}, wantOutput: "用法：", wantCode: ExitOK},
+		{name: "doctor flag", args: []string{"doctor", "--help"}, wantOutput: "只读检查", wantCode: ExitOK},
+	}
+	for _, item := range cases {
+		t.Run(item.name, func(t *testing.T) {
+			code, stdout, stderr := f.run(t, false, item.args...)
+			if code != item.wantCode {
+				t.Fatalf("退出码 = %d，stderr=%s", code, stderr)
+			}
+			if !strings.Contains(stdout, item.wantOutput) {
+				t.Fatalf("帮助输出缺少 %q：\n%s", item.wantOutput, stdout)
+			}
+		})
+	}
+
+	if code, _, stderr := f.run(t, false, "help", "no-such-command"); code != ExitUsage || !strings.Contains(stderr, "未知命令") {
+		t.Fatalf("未知帮助主题应返回用法错误，实际 code=%d stderr=%s", code, stderr)
+	}
+}
+
+func TestCheckUpdateCommand(t *testing.T) {
+	f := newFixture(t)
+	var stdout, stderr bytes.Buffer
+	env := Env{
+		Args:   []string{"check-update"},
+		Home:   f.home,
+		Stdout: &stdout,
+		Stderr: &stderr,
+		UpdateClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.URL.String() != "https://api.github.com/repos/white-x-7/codex-session-doctor/releases/latest" {
+				t.Fatalf("更新检查请求了未知地址：%s", request.URL)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"tag_name":"v0.2.0","html_url":"https://example.test/release"}`)),
+				Header:     make(http.Header),
+			}, nil
+		})},
+	}
+	if code := Run(env); code != ExitOK {
+		t.Fatalf("check-update 应成功，实际 %d，stderr=%s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "发现新版本") || !strings.Contains(stdout.String(), "https://example.test/release") {
+		t.Fatalf("更新输出异常：\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "来源：release") {
+		t.Fatalf("用户可见来源不应保留英文枚举值：\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	env.UpdateClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"tag_name":"v0.1.0","html_url":"https://example.test/release"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	if code := Run(env); code != ExitOK || !strings.Contains(stdout.String(), "已经是最新版本") {
+		t.Fatalf("已是最新版本的输出异常：code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	env.UpdateClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("测试网络错误")
+	})}
+	if code := Run(env); code != ExitFailure || !strings.Contains(stderr.String(), "检查更新失败") {
+		t.Fatalf("网络错误应返回失败，实际 code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	env.Args = []string{"check-update", "--timeout", "0"}
+	if code := Run(env); code != ExitUsage || !strings.Contains(stderr.String(), "1 到 300") {
+		t.Fatalf("非法超时应返回用法错误，实际 %d，stderr=%s", code, stderr.String())
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
 }
 
 // rollout 生成 brokenCount 条待修推理项，外加一条已经兼容官方接口的推理项。

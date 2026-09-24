@@ -4,6 +4,7 @@ package cli
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 
 	"github.com/white-x-7/codex-session-doctor/internal/codex"
@@ -38,6 +39,9 @@ type Env struct {
 	Home string
 	// IsRunning 检测桌面端是否运行，为空时使用真实检测；测试可替换。
 	IsRunning func(home string) bool
+	// UpdateClient 是更新检查使用的 HTTP 客户端；为空时使用默认客户端。
+	// 仅供测试注入传输层，命令行不会接受远程地址参数。
+	UpdateClient *http.Client
 }
 
 // Run 执行一次命令并返回退出码。
@@ -57,7 +61,9 @@ func Run(env Env) int {
 	case "":
 		printUsage(env.Stdout)
 		return ExitOK
-	case "help", "-h", "--help":
+	case "help":
+		return runHelp(env, rest)
+	case "-h", "--help":
 		printUsage(env.Stdout)
 		return ExitOK
 	case "version", "-v", "--version":
@@ -67,6 +73,8 @@ func Run(env Env) int {
 		return runDoctor(env, rest)
 	case "repair":
 		return runRepair(env, rest)
+	case "check-update":
+		return runCheckUpdate(env, rest)
 	default:
 		fmt.Fprintf(env.Stderr, "未知子命令：%s\n\n", command)
 		printUsage(env.Stderr)
@@ -124,9 +132,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, `codex-session-doctor —— 修复 Codex 会话历史，让被第三方接口推进过的会话能重新续聊
 
 用法：
+  codex-session-doctor help [命令]
   codex-session-doctor repair <会话id|rollout文件名> [选项]
   codex-session-doctor repair --all [选项]
   codex-session-doctor doctor
+  codex-session-doctor check-update [选项]
   codex-session-doctor version
 
 选项：
@@ -137,6 +147,7 @@ func printUsage(w io.Writer) {
                             （会改变文件长度，必须刷新历史投影）
   --no-refresh-history      不清理历史投影缓存
                             （仅调试用；正常修复不要加）
+  --timeout <秒>            check-update 的网络超时时间（默认 10 秒）
 
 退出码：
   0  成功

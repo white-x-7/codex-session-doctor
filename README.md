@@ -58,7 +58,7 @@ cd codex-session-doctor
 
 ### 第二步：编译并安装
 
-以下命令都要在**仓库根目录**（能看到 `go.mod` 的那一层）执行。三选一：
+下面的编译/安装命令需要在**仓库根目录**（能看到 `go.mod` 的那一层）执行。三选一：
 
 ```bash
 # 方式一：一键安装到 ~/.local/bin
@@ -74,7 +74,7 @@ make install PREFIX="$HOME/.local"
 make build
 ```
 
-上面两种安装方式都会调用 `go build` 编译，再把二进制复制到目标目录，不需要事先手动设置 `GOPATH` 之类的环境变量；首次编译会联网下载依赖模块。
+上面两种安装方式都会调用 `go build` 编译，再把二进制复制到目标目录，不需要事先手动设置 `GOPATH` 之类的环境变量；首次编译会联网下载依赖模块。安装完成后，`codex-session-doctor` 已经是 PATH 中的独立命令，后续执行 `help`、`doctor`、`check-update` 或 `repair` **不需要再进入仓库目录**。
 
 ### 第三步：确认装好了
 
@@ -113,6 +113,22 @@ rollout 总数 : 331 个（其中需要修复：6 个）
 `go build -o codex-session-doctor.exe ./cmd/codex-session-doctor` 编译后，把生成的 `.exe` 放到任意一个已在 `PATH` 里的目录即可，命令用法与 macOS、Linux 相同。`install.sh` 与 `Makefile` 依赖 POSIX shell，Windows 下请直接使用上面这条 `go build`。
 
 ## 使用
+
+先查看当前版本和全部命令：
+
+```bash
+codex-session-doctor version
+codex-session-doctor help
+codex-session-doctor help repair
+```
+
+检查是否有新版本：
+
+```bash
+codex-session-doctor check-update
+```
+
+该命令只读访问本仓库固定的 GitHub release/tag API，默认最多等待 10 秒；发现新版本时只显示 release 链接，不会自动下载、安装或修改任何文件。需要调整网络等待时间时可使用 `--timeout 1` 到 `--timeout 300`。
 
 先体检，看看有多少会话需要修复：
 
@@ -156,6 +172,7 @@ codex-session-doctor repair --all -y
 | `--force` | 即使 Codex 正在运行也继续写入（不建议） |
 | `--drop-foreign-reasoning` | 整行删除带非官方加密内容的推理项，会改变文件长度，必须配合刷新历史投影 |
 | `--no-refresh-history` | 不清理历史投影缓存，仅用于排查问题 |
+| `check-update --timeout <秒>` | 设置更新检查的网络超时，范围 1-300 秒，默认 10 秒 |
 
 ### 退出码
 

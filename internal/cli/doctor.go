@@ -13,6 +13,10 @@ import (
 
 // runDoctor 实现 doctor 子命令：只读地报告当前环境与待修会话数量。
 func runDoctor(env Env, args []string) int {
+	if hasHelpFlag(args) {
+		printDoctorUsage(env.Stdout)
+		return ExitOK
+	}
 	flags, positionals := splitArgs(args)
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(env.Stderr)
