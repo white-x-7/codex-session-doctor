@@ -52,7 +52,7 @@ func TestCompareSupportsStableAndPrereleaseVersions(t *testing.T) {
 }
 
 func TestCompareRejectsInvalidVersion(t *testing.T) {
-	for _, item := range [][2]string{{"0.1", "0.2.0"}, {"0.1.0", "latest"}, {"0.01.0", "0.2.0"}, {"0.1.0", "0.2.0-"}, {"0.1.0+", "0.2.0"}, {"0.1.0", "0.2.0-rc_1"}} {
+	for _, item := range [][2]string{{"0.1", "0.2.0"}, {"0.1.0", "latest"}, {"0.01.0", "0.2.0"}, {"+0.1.0", "0.2.0"}, {"0.1.0", "0.2.0-"}, {"0.1.0+", "0.2.0"}, {"0.1.0", "0.2.0-rc_1"}} {
 		if _, err := Compare(item[0], item[1]); err == nil {
 			t.Errorf("Compare(%q, %q) 应拒绝非法版本", item[0], item[1])
 		}

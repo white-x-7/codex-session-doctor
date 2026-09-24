@@ -206,8 +206,8 @@ func parseVersion(raw string) (version, error) {
 	parsed := version{}
 	values := []*int{&parsed.major, &parsed.minor, &parsed.patch}
 	for index, component := range core {
-		if component == "" || (len(component) > 1 && component[0] == '0') {
-			return version{}, errors.New("数字段不能有前导零")
+		if component == "" || !isNumeric(component) || (len(component) > 1 && component[0] == '0') {
+			return version{}, errors.New("数字段必须是十进制整数且不能有前导零")
 		}
 		number, err := strconv.Atoi(component)
 		if err != nil || number < 0 {
