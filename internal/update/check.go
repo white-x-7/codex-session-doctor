@@ -55,14 +55,27 @@ func Check(ctx context.Context, client *http.Client, current string) (Result, er
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	ctx, cancel := context.WithTimeout(ctx, DefaultTimeout)
-	defer cancel()
+	_, hasDeadline := ctx.Deadline()
+	if !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
+		defer cancel()
+	}
 	if _, err := parseVersion(current); err != nil {
 		return Result{}, fmt.Errorf("当前版本无效：%w", err)
 	}
 	if client == nil {
-		client = &http.Client{Timeout: DefaultTimeout}
+		client = &http.Client{}
+		if !hasDeadline {
+			client.Timeout = DefaultTimeout
+		}
 	}
+	// 固定 API 地址不需要跟随重定向，避免请求被带到非 GitHub 主机。
+	safeClient := *client
+	safeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return errors.New("更新 API 不允许重定向")
+	}
+	client = &safeClient
 
 	latest, releaseURL, err := fetchRelease(ctx, client)
 	source := "release"

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -313,6 +314,31 @@ func TestCheckUpdateCommand(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "发现新版本") || !strings.Contains(stdout.String(), "https://example.test/release") {
 		t.Fatalf("更新输出异常：\n%s", stdout.String())
+	}
+	if strings.Contains(stdout.String(), "来源：release") {
+		t.Fatalf("用户可见来源不应保留英文枚举值：\n%s", stdout.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	env.UpdateClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader(`{"tag_name":"v0.1.0","html_url":"https://example.test/release"}`)),
+			Header:     make(http.Header),
+		}, nil
+	})}
+	if code := Run(env); code != ExitOK || !strings.Contains(stdout.String(), "已经是最新版本") {
+		t.Fatalf("已是最新版本的输出异常：code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	env.UpdateClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("测试网络错误")
+	})}
+	if code := Run(env); code != ExitFailure || !strings.Contains(stderr.String(), "检查更新失败") {
+		t.Fatalf("网络错误应返回失败，实际 code=%d stdout=%s stderr=%s", code, stdout.String(), stderr.String())
 	}
 
 	stdout.Reset()

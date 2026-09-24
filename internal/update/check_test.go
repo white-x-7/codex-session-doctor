@@ -130,3 +130,29 @@ func TestCheckHonorsContextTimeout(t *testing.T) {
 		t.Fatalf("超时错误异常：%v", err)
 	}
 }
+
+func TestCheckPreservesCallerTimeoutAndRejectsRedirect(t *testing.T) {
+	deadlineClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		deadline, ok := request.Context().Deadline()
+		if !ok || time.Until(deadline) < 200*time.Millisecond {
+			t.Fatalf("调用方超时没有传递给 HTTP 请求：deadline=%v", deadline)
+		}
+		return jsonResponse(http.StatusOK, `{"tag_name":"v0.1.0"}`), nil
+	})}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	if _, err := Check(ctx, deadlineClient, "0.1.0"); err != nil {
+		t.Fatalf("调用方超时应被保留：%v", err)
+	}
+
+	redirectClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusFound,
+			Header:     http.Header{"Location": []string{"http://example.invalid/redirect"}},
+			Body:       io.NopCloser(strings.NewReader("")),
+		}, nil
+	})}
+	if _, err := Check(context.Background(), redirectClient, "0.1.0"); err == nil {
+		t.Fatal("更新 API 重定向应被拒绝")
+	}
+}

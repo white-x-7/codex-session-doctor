@@ -40,7 +40,7 @@ func runCheckUpdate(env Env, args []string) int {
 	}
 
 	fmt.Fprintf(env.Stdout, "当前版本：%s\n", result.Current)
-	fmt.Fprintf(env.Stdout, "最新版本：%s（来源：%s）\n", result.Latest, result.Source)
+	fmt.Fprintf(env.Stdout, "最新版本：%s（来源：%s）\n", result.Latest, sourceLabel(result.Source))
 	if result.UpdateAvailable {
 		fmt.Fprintln(env.Stdout, "发现新版本。工具不会自动下载或安装，请打开下面的链接查看更新：")
 		fmt.Fprintf(env.Stdout, "%s\n", result.URL)
@@ -48,4 +48,15 @@ func runCheckUpdate(env Env, args []string) int {
 		fmt.Fprintln(env.Stdout, "当前已经是最新版本。")
 	}
 	return ExitOK
+}
+
+func sourceLabel(source string) string {
+	switch source {
+	case "release":
+		return "正式版本"
+	case "tag":
+		return "版本标签"
+	default:
+		return "远程版本信息"
+	}
 }
