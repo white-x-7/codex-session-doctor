@@ -1,163 +1,221 @@
-# codex-api-switch
+# codex-session-doctor
 
-一键切换 Codex 的 API 服务商（OpenAI ↔ DeepSeek Responses API），并在切换时自动同步本地对话历史标签，让旧对话在新服务商下继续全部显示。
+诊断并修复 Codex 的本地会话历史，让被第三方接口推进过的会话能够重新在官方接口下显示和续聊。
 
-> 非 OpenAI 官方工具。仅支持 macOS（桌面应用部分），CLI 部分跨平台。
+> 本仓库复刻（fork）自上游仓库 **[boommilk1996-milk/codex-api-switch](https://github.com/boommilk1996-milk/codex-api-switch)**，并把实现语言从 Python 重写为 Go。
+>
+> 本工具是非官方工具，与 OpenAI 无关。上游原始说明已完整保留在 [docs/upstream-README.md](docs/upstream-README.md)，来源与改动记录见 [UPSTREAM.md](UPSTREAM.md)。
 
-本仓库是基于上游项目的私有维护版本。上游来源、导入提交和本地改动记录见
-[`UPSTREAM.md`](UPSTREAM.md)，未修改的上游说明保留在
-[`README.upstream.md`](README.upstream.md)。会话修复的完整操作步骤见
-[`docs/repair.md`](docs/repair.md)，回滚方法见 [`docs/rollback.md`](docs/rollback.md)。
+## 它解决什么问题
 
-## 为什么需要这个工具
-
-Codex 桌面端（及 `list_threads`）会按当前 `model_provider` 过滤任务列表。切换服务商后，之前在其他服务商下创建的会话会从侧边栏"消失"——**数据并没有丢**，只是被过滤隐藏了（相关 issue：openai/codex #31625，官方尚未修复）。
-
-本工具的 `sync` 功能把历史会话的 `model_provider` 标签统一改成当前服务商，同时把会话级模型设置一并改成目标模型（如 `gpt-5.5` → `deepseek-v4-flash`），并保持元数据一致：
-
-1. `state_5.sqlite` 的 `threads.model_provider`（桌面端列表过滤依据）
-2. 会话 JSONL 文件第一行 `session_meta.payload.model_provider`（Codex 重启后会用它重建数据库，只改这里才不会被覆盖）
-3. `session_index.jsonl`（缺失的任务 ID 合并进去）
-
-切换回原来的服务商时再次执行同步即可，历史会跟着搬回去，模型也会还原为 OpenAI 默认模型（避免续聊时把旧模型名发给新服务商）。
-
-## 为什么还需要 repair（array too long 报错）
-
-用第三方 API（如 DeepSeek）推进过的长会话，会话文件里记录的是**明文推理内容**（`reasoning` 项的 `content` 数组）。切回官方 Codex 后，续聊旧会话触发自动压缩（remote compact）时，官方 Responses API 要求 `reasoning` 项的 `content` 必须为空数组，于是报：
+用第三方 Responses 兼容接口（例如 DeepSeek）推进过的会话，rollout 文件里会记录**明文推理内容**，以及第三方写入的 `encrypted_content` 占位符。切回官方接口继续这个会话时，官方会拒绝回放这段历史：
 
 ```text
-Invalid 'input[7].content': array too long. Expected an array with maximum length 0, but got an array with length 1 instead.
+Invalid 'input[N].content': array too long. Expected an array with maximum length 0, but got an array with length 1 instead.
+The encrypted content ... could not be verified.
 ```
 
-这**不是对话丢失，也不是工具写坏文件**，只是历史消息格式与回放 API 不兼容。`repair` 会备份后把这类 `reasoning` 项的 `content` 清空（其余消息原样保留），会话即可继续推进。`openai` 切换命令会在 Codex 未运行时**自动执行修复**，无需手动干预。
+还有一种更隐蔽的情况：Codex 用 `thread_history_*.sqlite` 缓存已解析的历史，缓存里记录的是 rollout 文件的**字节偏移**。如果修复时改变了文件长度，缓存偏移就会失效，重新打开会话会报：
 
-## 模型版本
+```text
+invalid paginated history lineage for <会话id>: cutoff byte offset is past the source rollout
+```
 
-- `deepseek-v4-flash` 当前对应官方 **DeepSeek-V4-Flash-0731**
-- `deepseek-v4-pro` 当前对应官方 **DeepSeek-V4-Pro-0813**（GA 正式版，2026-08-12 发布）
-- 调用名保持不变，切换工具无需改配置即可使用最新版；官方参数：上下文 1M、输出最大 384K、支持思考/非思考模式与 Responses API。
+这两种现象都不是对话丢失，而是历史格式与回放接口不兼容。本工具会清掉不兼容的字段，同时保证文件长度不变，并让 Codex 重新解析受影响的会话。
 
-## 功能
+## 会修什么、不会修什么
 
-- `deepseek`：切到 DeepSeek Responses API（自动写 `config.toml` 与模型目录）
-- `openai`：从恢复点还原 OpenAI 配置，并自动修复历史中的明文推理内容
-- `sync`：把全部用户主任务的历史标签同步为当前服务商，并同步会话级模型（自动备份，可回滚）
-- `repair`：备份并修复会话文件里不兼容的 `reasoning` 内容，同时处理多 rollout 会话、伪造 `encrypted_content` 和历史投影缓存
-- `status` / `status --json`：查看当前配置与运行状态
-- `is-running`：检测 Codex 桌面端是否在运行
-- 桌面应用（JXA）：`Codex_API_切换.app.js` 编译成 macOS App，双击即可操作
+会修：
 
-## 安全设计
+- 推理项里的明文 `content` 置为空数组
+- 第三方写入的、无法被官方校验的 `encrypted_content` 移除（官方 `gAAAAA` 开头的密文原样保留）
+- 一个会话对应的全部 rollout（初始文件加上每次续写）一起处理
+- 刷新 `thread_history_*.sqlite` 里命中会话的缓存行，让 Codex 重新计算字节偏移
 
-- **绝不读写、不打印 API Key**。DeepSeek Key 只通过 `--api-key` 参数或 `DEEPSEEK_API_KEY` 环境变量传入，写入 `config.toml` 后由你自行保管；`status` 输出仅显示掩码。
-- 同步前自动备份：SQLite 在线备份 + 每个将被修改会话文件第一行的 base64 清单，存于 `~/.codex/backups/codex-api-switch/sync-<时间戳>/`，可完整回滚。
-- 修复前自动备份：每个被修复的会话文件原样复制 + SHA-256 清单，存于 `~/.codex/backups/codex-api-switch/repair-<时间戳>/`，可完整回滚。
-- 只修改用户主任务（`thread_source` 为 `user`/空且未归档），子任务、评审、归档会话一律不动。
-- Codex 桌面端运行中**拒绝**修改历史（运行中的进程可能覆盖写入），会提示你先退出再同步/修复。
-- 每次同步只改写会话文件第一行的 provider 字段，其余字节保持不变。
-- 同步会话模型时只改写 `thread_settings.model` / `model_provider_id`、`state` 与 `turn_context` 中的模型字段，消息内容一律不动。
+不会做：
+
+- 不改写、不切换、不读取任何 API Key
+- 不改 `config.toml`，不切换服务商，不做"切到 DeepSeek / 切回 OpenAI"
+- 不改动对话正文、工具调用、摘要和元数据
+- 不处理子任务、评审等非用户主任务之外的历史
 
 ## 安装
 
-要求 Python 3.9+（需要 `tomllib`，Python 3.11+ 内置；更早版本 `pip3 install tomli`）。
+### 前置条件
 
-### 方式一：一键安装（推荐）
+- Go 1.25 或更高版本。用 `go version` 确认；没有的话，macOS 可以 `brew install go`，其他系统从 <https://go.dev/dl/> 下载。
+- 本机就是你在用 Codex 的那台机器，也就是存在 `~/.codex/` 目录的机器。
+- 不需要 cgo，也不需要 C 编译器：SQLite 走的是纯 Go 驱动。
 
-下载仓库后，在仓库根目录执行：
-
-```bash
-bash install.sh              # 安装 CLI 到 ~/.local/bin
-bash install.sh --app        # 顺便编译 macOS 桌面应用
-bash install.sh --prefix DIR # 安装到自定义目录
-```
-
-脚本会自动检查 Python 版本、安装缺失的 `tomli`、把 `codex-api-switch` 放进 PATH（并提示如果不在），可选编译桌面应用。
-
-### 方式二：手动安装
+### 第一步：取得代码
 
 ```bash
-# 1. 把 CLI 放进 PATH，例如：
-cp codex-api-switch ~/.local/bin/
-chmod +x ~/.local/bin/codex-api-switch
-
-# 2. （可选）把模型目录放到与脚本同目录：
-cp deepseek-models.json ~/.local/bin/
+git clone https://github.com/white-x-7/codex-session-doctor.git
+cd codex-session-doctor
 ```
 
-桌面应用（可选，macOS）：
+接下来所有命令都在这个目录里执行，也就是能看到 `go.mod` 和 `cmd` 的那一层。
+
+### 第二步：编译并安装
+
+以下命令都要在**仓库根目录**（能看到 `go.mod` 的那一层）执行。三选一：
 
 ```bash
-osacompile -l JavaScript -o "Codex API 切换.app" Codex_API_切换.app.js
+# 方式一：一键安装到 ~/.local/bin
+bash install.sh
+
+# 装到别的前缀（会放到 <前缀>/bin 下；装到 /usr/local 需要 sudo）
+bash install.sh --prefix /usr/local
+
+# 方式二：用 make（等价于上面两条）
+make install PREFIX="$HOME/.local"
+
+# 方式三：只编译，不安装，在当前目录生成 ./codex-session-doctor
+make build
 ```
+
+上面两种安装方式都会调用 `go build` 编译，再把二进制复制到目标目录，不需要事先手动设置 `GOPATH` 之类的环境变量；首次编译会联网下载依赖模块。
+
+### 第三步：确认装好了
+
+```bash
+codex-session-doctor version
+```
+
+如果提示 `command not found`，说明安装目录不在 `PATH` 里。`install.sh` 检测到这种情况时会打印提示，按提示把下面的内容加到 shell 配置即可（zsh 为例）：
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+### 第四步：确认能读到 Codex 数据
+
+```bash
+codex-session-doctor doctor
+```
+
+能打印出下面这几项，就说明环境正常，可以进入下面的「使用」：
+
+```text
+Codex 主目录 : /Users/你的用户名/.codex
+进程状态     : 未运行
+state 数据库 : 可读（state_5.sqlite）
+rollout 总数 : 331 个（其中需要修复：6 个）
+历史投影库   : thread_history_1.sqlite
+备份目录     : /Users/你的用户名/.codex/backups/codex-session-doctor
+```
+
+如果 `state 数据库` 那一行显示「未找到（仅按 sessions 目录扫描）」，通常是这台机器还没跑过 Codex，或者 `~/.codex/` 在别的位置（用 `CODEX_HOME` 指过去）。这时工具仍能按目录扫描，只是列表可能不全。
 
 ### Windows
 
-1. 安装 Python 3.11+（安装时勾选 **Add to PATH**）
-2. 双击 `Codex API 切换.cmd` 打开菜单（或右键以 PowerShell 运行 `codex-api-switch-gui.ps1`）
-3. 按菜单操作：查看状态 / 切换服务商 / 同步历史 / 管理 Key
-
-CLI 在 Windows 上同样可用（`codex-api-switch status / deepseek / openai / sync / key / repair`），进程检测会自动使用 `tasklist` 判断 Codex 是否运行。
-
-### 使用前的准备
-
-1. 本机已安装 Codex（工具操作的是 `~/.codex/` 下的配置与会话）。
-2. 准备一个 DeepSeek API Key：到 DeepSeek 开放平台注册并创建 `sk-` 开头的 Key。**工具不包含任何现成 Key**。
+`go build -o codex-session-doctor.exe ./cmd/codex-session-doctor` 编译后，把生成的 `.exe` 放到任意一个已在 `PATH` 里的目录即可，命令用法与 macOS、Linux 相同。`install.sh` 与 `Makefile` 依赖 POSIX shell，Windows 下请直接使用上面这条 `go build`。
 
 ## 使用
 
-```bash
-# 查看当前状态
-codex-api-switch status
-
-# 先预览会同步多少条历史（只读，安全）
-codex-api-switch sync --dry-run
-
-# 保存 DeepSeek API Key（只需一次，之后切换不再询问）
-codex-api-switch key set 'sk-...'
-codex-api-switch key status        # 查看是否已保存（只显示掩码）
-codex-api-switch key clear         # 忘记已保存的 Key
-
-# 完全退出 Codex 后，切到 DeepSeek（自动同步历史，Key 自动读取）
-codex-api-switch deepseek
-# 用 DeepSeek V4-Pro-0813（默认即 Pro；已处于 DeepSeek 时同样可用，会原地切换模型）
-codex-api-switch deepseek --model pro
-codex-api-switch deepseek --model flash
-
-# 切回 OpenAI（自动同步历史 + 自动修复 reasoning 历史，防止 array too long）
-codex-api-switch openai
-
-# 只同步历史标签，不切换配置
-codex-api-switch sync
-
-# 排查 / 修复 array too long：
-codex-api-switch repair --all --dry-run   # 先只看哪些会话需要修复
-codex-api-switch repair <会话id> --dry-run # 预览指定会话（只读）
-codex-api-switch repair <会话id> -y        # 修复指定会话（自动备份）
-codex-api-switch repair --all -y           # 修复全部受影响会话（自动备份）
-```
-
-桌面应用使用流程：
-
-1. 完全退出 Codex（Cmd+Q）
-2. 双击 `Codex API 切换.app`
-3. 首次切换时按提示填写一次 DeepSeek API Key（之后永久保存，不会再问）
-4. 点击"切到 DeepSeek"或"切回 OpenAI"
-5. 应用自动完成配置切换 + 历史同步，重新打开 Codex 即可看到全部历史
-
-切到 DeepSeek 或切换模型时，桌面应用会弹窗让你选模型：**V4 Pro (0813)**（默认）或 **V4 Flash (0731)**；已经处于 DeepSeek 状态时主面板有「切换 Pro/Flash」按钮，可随时原地切换，无需先切回 OpenAI。
-
-DeepSeek API Key 保存在 `~/.codex/backups/codex-api-switch/deepseek-key`（权限 600，仅当前用户可读），切回 OpenAI 也不会丢失；需要更换时用 `codex-api-switch key set 'sk-...'` 覆盖即可。
-
-## 测试
+先体检，看看有多少会话需要修复：
 
 ```bash
-python3 test_sync.py
+codex-session-doctor doctor
 ```
 
-测试在临时目录模拟完整的 Codex 目录结构，覆盖：dry-run、apply、幂等性、OpenAI ↔ DeepSeek 双向切换自动同步、子任务不动、索引合并、备份清单与回滚信息、`repair` 单会话/全部/幂等/运行中拒绝/切换自动修复。
+修复前**完全退出 Codex（Cmd+Q）**，然后先预演一次：
+
+```bash
+codex-session-doctor repair 01a0c369-caf2-71c1-bdf1-a1f56cd46f00 --dry-run
+```
+
+确认无误后正式修复：
+
+```bash
+codex-session-doctor repair 01a0c369-caf2-71c1-bdf1-a1f56cd46f00 -y
+```
+
+或者一次修复全部受影响的会话：
+
+```bash
+codex-session-doctor repair --all --dry-run
+codex-session-doctor repair --all -y
+```
+
+修完重新打开 Codex 并继续该会话即可。
+
+### `-y` 是什么意思
+
+`-y` 是 `--yes` 的缩写，只表示**跳过"是否继续"的确认提示**，方便脚本和批量操作。它不代表强制修复。真正绕过安全检查的是 `--force`：只有加了它，工具才会在检测到 Codex 正在运行时继续写入。
+
+### 参数说明
+
+| 参数 | 作用 |
+| --- | --- |
+| `<会话id>` | 修复指定会话；可以直接粘贴会话 UUID，工具会自动找到它的全部 rollout |
+| `--all` | 修复所有受影响的会话 |
+| `--dry-run` | 只列出将要改动的内容，不写任何文件 |
+| `-y`, `--yes` | 跳过确认提示 |
+| `--force` | 即使 Codex 正在运行也继续写入（不建议） |
+| `--drop-foreign-reasoning` | 整行删除带非官方加密内容的推理项，会改变文件长度，必须配合刷新历史投影 |
+| `--no-refresh-history` | 不清理历史投影缓存，仅用于排查问题 |
+
+### 退出码
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 成功 |
+| 1 | 修复失败 |
+| 2 | 参数用法错误 |
+| 3 | 检测到 Codex 正在运行，已拒绝写入 |
+
+## 安全设计
+
+- **写入前一定备份。** 每个被修复的 rollout 都会原样复制到 `~/.codex/backups/codex-session-doctor/repair-<时间戳>/`，并附上 SHA-256 清单；如果存在历史投影库，它的数据库本体以及 `-wal`、`-shm` 边车文件也会一起进快照。
+- **字节长度不变。** 正常修复通过补空格保持每一行的原始长度，因此 Codex 缓存的字节偏移继续有效。万一重写后变长，工具会直接报错并放弃写入，而不是写出一个偏移失效的文件。
+- **运行中拒绝写入。** 桌面端正在运行时可能覆盖写这些文件，工具会检测并返回退出码 3，提示你先退出 Codex。
+- **只碰该碰的字段。** 无关的行按字节原样保留；数字按原始字面量输出，避免大整数被浮点化。
+- **原子写入。** 改写后的 rollout 先写同目录临时文件再改名覆盖，即使中途被打断也不会留下残缺文件；文件权限保持原样。
+- **备份失败就不动手。** 历史投影库备份失败时，工具会保留数据库原样并给出警告。
+- **不悄悄跳过。** 读不了的 rollout 会作为警告列出来，而不是从待修列表里静默消失。
+
+回滚方法见 [docs/rollback.md](docs/rollback.md)。
+
+## 与上游的差异
+
+上游 `codex-api-switch` 是一个服务商切换工具，本仓库只保留它的会话修复能力：
+
+| 功能 | 上游 | 本仓库 |
+| --- | --- | --- |
+| 修复无法续聊的会话 | 有 | 有，并扩展了多 rollout、密文清理与历史投影刷新 |
+| 切到第三方服务商 | 有 | 已移除 |
+| 切回官方服务商 | 有 | 已移除 |
+| 同步历史标签 / 会话模型 | 有 | 已移除 |
+| 存储 API Key | 有 | 已移除 |
+| `status`（查看当前服务商） | 有 | 已移除，改为 `doctor` 体检会话状态 |
+| `is-running`（检测桌面端是否运行） | 有 | 已移除，改为 `doctor` 输出里的「进程状态」一行 |
+| 一键发布脚本 `push-all.sh` | 有 | 已移除 |
+| 语言 | Python | Go |
+| 配套界面 | macOS JXA 应用、PowerShell 菜单 | 已移除，只保留命令行 |
+
+## 从上游迁移过来的注意事项
+
+如果你之前用的是上游 `codex-api-switch`，有两点变化需要留意：
+
+- **备份目录换了位置**：新工具的备份写在 `~/.codex/backups/codex-session-doctor/`。上游写的 `~/.codex/backups/codex-api-switch/` 不会被自动读取或删除，里面的快照仍然可以按老路径手动回滚。
+- **隔离环境变量改了名**：`CODEX_SWITCH_HOME` 换成 `CODEX_SESSION_DOCTOR_HOME`。如果你有依赖旧变量名的脚本（比如用模拟目录做测试的脚本），需要同步改掉；调用命令行修复的脚本一般不受影响。
+
+## 开发
+
+```bash
+make check    # go vet + go test
+make test     # 只跑测试
+make fmt      # 格式化
+```
+
+测试覆盖了字节长度不变、官方与伪加密文的区分、无关行不被改写、大整数字面量保持、重复修复幂等、多 rollout 会话的父子 id 解析、只清理命中会话的历史投影、运行中拒绝写入与 `--force` 行为，以及端到端的修复流程。
+
+实现思路和关键约束见 [docs/architecture.md](docs/architecture.md)。
 
 ## 已知边界
 
-- 同步是"换标签"不是复制：会话在某服务商标签下，就由该服务商显示与续聊；切回原服务商需再次同步（模型会同时还原为 OpenAI 默认模型）。
-- `repair` 会清空旧会话里的明文推理内容，修复后该会话在官方 API 下可正常回放；DeepSeek 侧的续聊不依赖这些明文内容（推理内容由模型重新生成）。
-- 极早期的会话（老版本 Codex 创建）打开续聊时若遇兼容问题，可用 `~/.codex/backups/codex-api-switch/` 中的备份回滚。
+- 第三方写入的加密内容无法被还原成官方可验证的密文，工具只能移除它，让其余历史可以回放；隐藏的推理过程本身不会恢复。
+- 修复依赖本地文件结构（`state_5.sqlite`、`thread_history_*.sqlite`、`sessions/` 目录）。Codex 若在未来版本调整这些结构，需要同步更新本工具。
+- `state_5.sqlite` 短时间无法读取时，工具会退化为只扫描 `sessions/` 与 `archived_sessions/` 目录并给出警告。

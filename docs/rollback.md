@@ -1,26 +1,40 @@
-# Rollback
+# 回滚指南
 
-Every repair writes a timestamped backup directory under:
+每一次修复都会写入一个独立的快照目录，回滚就是把快照里的文件放回原位。
+
+## 备份放在哪
 
 ```text
-~/.codex/backups/codex-api-switch/repair-<timestamp>/
+~/.codex/backups/codex-session-doctor/repair-<时间戳>/
 ```
 
-The backup contains the original rollout paths and `manifest.json` with SHA-256
-checksums. When a history projection database is present, its SQLite file and
-available `-wal` and `-shm` sidecars are copied into the same snapshot.
+目录里包含：
 
-If a repair must be reverted, fully quit Codex, identify the matching files in
-the manifest, copy those backup files back to their original paths, restore the
-matching history database and sidecars together, and then reopen Codex. Keep
-the backup until the restored task has been opened and continued successfully.
+| 内容 | 说明 |
+| --- | --- |
+| `sessions/...`、`archived_sessions/...` | 被修复的 rollout 文件原件，目录结构与主目录一致 |
+| `manifest.json` | 每个 rollout 的原始路径、SHA-256 与快照路径 |
+| `thread_history_<版本>.sqlite` | 历史投影库在清理前的副本 |
+| `thread_history_<版本>.sqlite-wal`、`-shm` | SQLite 边车文件，存在时才复制 |
 
-The `invalid paginated history lineage` error means that a cached byte offset
-is past the current rollout length. This repository prevents that during the
-normal repair by preserving byte lengths and drops the affected projection rows
-when a size-changing operation is explicitly requested.
+## 怎么回滚
 
-Encrypted content produced by a foreign provider cannot be reconstructed by
-this tool. The repair removes an unverifiable placeholder so the official API
-can replay the rest of the history; it cannot recover the original hidden
-reasoning token.
+1. **完全退出 Codex（Cmd+Q）。** 桌面端运行时会覆盖写这些文件。
+2. 打开 `manifest.json`，找到你要回滚的会话对应的条目。
+3. 把快照里的 rollout 文件复制回 `manifest.json` 里记录的原始路径。
+4. 如果快照里有历史投影库，把数据库本体和它的 `-wal`、`-shm` 一起复制回 `~/.codex/`。**一定要一起放回**，只放主库会丢掉边车文件里尚未合并的事务。
+5. 重新打开 Codex，确认该会话可以正常打开，再决定是否删除备份。
+
+在确认恢复成功之前，不要删除快照目录。
+
+## 想撤销投影清理、但保留修复
+
+如果只是历史投影被清了、想回到清理前的状态，从快照里取回历史数据库及其边车文件即可，rollout 文件保持修复后的版本。Codex 会在下次打开会话时重新解析并重建缓存。
+
+## 常见报错与快照的关系
+
+`invalid paginated history lineage ... cutoff byte offset is past the source rollout` 表示缓存里的字节偏移超出了当前文件长度。它通常来自"文件被改短但缓存没刷新"。本工具的正常修复路径会保持字节长度，因此不会产生这种偏移失效。
+
+## 第三方加密内容无法还原
+
+第三方写入的 `encrypted_content` 是无法被官方接口验证的占位符，工具只能移除它，让其余历史可以回放。隐藏的推理内容本身不会因为回滚而恢复，因为它在写入时就不是官方格式。

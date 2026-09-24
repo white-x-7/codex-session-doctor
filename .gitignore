@@ -3,3 +3,8 @@ __pycache__/
 .DS_Store
 *.bak
 *.bak-*
+
+# 构建产物
+/codex-session-doctor
+/dist/
+/bin/
